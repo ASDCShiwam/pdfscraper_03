@@ -165,6 +165,7 @@ def crawl_and_download(
     return downloaded
 
 
+
 def _is_allowed_host(parsed: ParseResult, allowed: Set[str]) -> bool:
     netloc = parsed.netloc.lower()
     hostname = parsed.hostname.lower() if parsed.hostname else ""
@@ -229,6 +230,7 @@ def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
                 discovered.setdefault(normalized, None)
 
     return list(discovered.keys())
+
 
 
 def _get_with_ssl_fallback(

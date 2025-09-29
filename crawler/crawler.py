@@ -1,12 +1,13 @@
 import hashlib
 import logging
 import os
+import re
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
-from urllib.parse import urljoin, urldefrag, urlparse
+from typing import Dict, Iterable, Iterator, List, Optional, Set
+from urllib.parse import ParseResult, urljoin, urldefrag, urlparse
 
 import bs4
 import requests
@@ -30,6 +31,8 @@ VERIFY_SSL = os.getenv("CRAWLER_VERIFY_SSL", "true").lower() not in {
 _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 _SESSION.verify = VERIFY_SSL
+
+PDF_PATTERN = re.compile(r"[^'\"()<>\\\s]+\.pdf(?:[?#][^'\"()<>\\\s]*)?", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,26 @@ def crawl_and_download(
         except (bs4.FeatureNotFound, bs4.builder.ParserRejectedMarkup, AssertionError) as exc:
             logger.warning("Skipping %s: unable to parse HTML (%s)", current_url, exc)
             continue
+
+        pdf_links = _extract_pdf_urls(soup, current_url)
+        for pdf_url in pdf_links:
+            parsed_pdf = urlparse(pdf_url)
+            if allowed and not _is_allowed_host(parsed_pdf, allowed):
+                continue
+
+            if pdf_url in downloaded_urls:
+                continue
+
+            pdf_info = download_pdf(pdf_url, download_folder)
+            if pdf_info:
+                pdf_info["source_page"] = current_url
+                downloaded.append(pdf_info)
+                downloaded_urls.add(pdf_url)
+
+                if max_pdfs is not None and len(downloaded) >= max_pdfs:
+                    logger.info("Reached maximum PDF limit of %s", max_pdfs)
+                    return downloaded
+
         for link in soup.select("a[href]"):
             href = link.get("href")
             if not href:
@@ -130,28 +153,84 @@ def crawl_and_download(
             if parsed.scheme not in {"http", "https"}:
                 continue
 
-            netloc = parsed.netloc.lower()
-            hostname = parsed.hostname.lower() if parsed.hostname else ""
-            if allowed and netloc not in allowed and hostname not in allowed:
+            if allowed and not _is_allowed_host(parsed, allowed):
                 continue
 
             if parsed.path.lower().endswith(".pdf"):
-                if full_url in downloaded_urls:
-                    continue
+                continue
 
-                pdf_info = download_pdf(full_url, download_folder)
-                if pdf_info:
-                    pdf_info["source_page"] = current_url
-                    downloaded.append(pdf_info)
-                    downloaded_urls.add(full_url)
-
-                    if max_pdfs is not None and len(downloaded) >= max_pdfs:
-                        logger.info("Reached maximum PDF limit of %s", max_pdfs)
-                        return downloaded
-            elif full_url not in visited:
+            if full_url not in visited:
                 queue.append(full_url)
 
     return downloaded
+
+
+
+def _is_allowed_host(parsed: ParseResult, allowed: Set[str]) -> bool:
+    netloc = parsed.netloc.lower()
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    return netloc in allowed or hostname in allowed
+
+
+def _iter_attribute_strings(value: object) -> Iterator[str]:
+    if value is None:
+        return
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_attribute_strings(item)
+        return
+
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_attribute_strings(item)
+        return
+
+    yield str(value)
+
+
+def _normalize_pdf_candidate(candidate: str, base_url: str) -> Optional[str]:
+    candidate = candidate.strip().strip("'\"")
+    if not candidate or candidate.lower().startswith("javascript:"):
+        return None
+
+    if candidate.startswith("//"):
+        base_parsed = urlparse(base_url)
+        candidate = f"{base_parsed.scheme}:{candidate}"
+
+    normalized = urljoin(base_url, candidate)
+    parsed = urlparse(normalized)
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    if not parsed.path.lower().endswith(".pdf"):
+        return None
+
+    parsed = parsed._replace(fragment="")
+    return parsed.geturl()
+
+
+def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    discovered: Dict[str, None] = {}
+
+    for element in soup.find_all(True):
+        for attr_value in element.attrs.values():
+            for text_value in _iter_attribute_strings(attr_value):
+                for match in PDF_PATTERN.finditer(text_value):
+                    normalized = _normalize_pdf_candidate(match.group(0), base_url)
+                    if normalized:
+                        discovered.setdefault(normalized, None)
+
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text() or ""
+        for match in PDF_PATTERN.finditer(script_text):
+            normalized = _normalize_pdf_candidate(match.group(0), base_url)
+            if normalized:
+                discovered.setdefault(normalized, None)
+
+    return list(discovered.keys())
+
 
 
 def _get_with_ssl_fallback(

@@ -1,12 +1,14 @@
 import hashlib
 import logging
 import os
+import re
 import time
 from collections import deque
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set
-from urllib.parse import urljoin, urldefrag, urlparse
+from typing import Dict, Iterable, Iterator, List, Optional, Set
+from urllib.parse import ParseResult, urljoin, urldefrag, urlparse, unquote
 
 import bs4
 import requests
@@ -30,6 +32,8 @@ VERIFY_SSL = os.getenv("CRAWLER_VERIFY_SSL", "true").lower() not in {
 _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 _SESSION.verify = VERIFY_SSL
+
+PDF_PATTERN = re.compile(r"[^'\"()<>\\\s]+\.pdf(?:[?#][^'\"()<>\\\s]*)?", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +122,26 @@ def crawl_and_download(
         except (bs4.FeatureNotFound, bs4.builder.ParserRejectedMarkup, AssertionError) as exc:
             logger.warning("Skipping %s: unable to parse HTML (%s)", current_url, exc)
             continue
+
+        pdf_links = _extract_pdf_urls(soup, current_url)
+        for pdf_url in pdf_links:
+            parsed_pdf = urlparse(pdf_url)
+            if allowed and not _is_allowed_host(parsed_pdf, allowed):
+                continue
+
+            if pdf_url in downloaded_urls:
+                continue
+
+            pdf_info = download_pdf(pdf_url, download_folder)
+            if pdf_info:
+                pdf_info["source_page"] = current_url
+                downloaded.append(pdf_info)
+                downloaded_urls.add(pdf_url)
+
+                if max_pdfs is not None and len(downloaded) >= max_pdfs:
+                    logger.info("Reached maximum PDF limit of %s", max_pdfs)
+                    return downloaded
+
         for link in soup.select("a[href]"):
             href = link.get("href")
             if not href:
@@ -130,28 +154,120 @@ def crawl_and_download(
             if parsed.scheme not in {"http", "https"}:
                 continue
 
-            netloc = parsed.netloc.lower()
-            hostname = parsed.hostname.lower() if parsed.hostname else ""
-            if allowed and netloc not in allowed and hostname not in allowed:
+            if allowed and not _is_allowed_host(parsed, allowed):
                 continue
 
             if parsed.path.lower().endswith(".pdf"):
-                if full_url in downloaded_urls:
-                    continue
+                continue
 
-                pdf_info = download_pdf(full_url, download_folder)
-                if pdf_info:
-                    pdf_info["source_page"] = current_url
-                    downloaded.append(pdf_info)
-                    downloaded_urls.add(full_url)
-
-                    if max_pdfs is not None and len(downloaded) >= max_pdfs:
-                        logger.info("Reached maximum PDF limit of %s", max_pdfs)
-                        return downloaded
-            elif full_url not in visited:
+            if full_url not in visited:
                 queue.append(full_url)
 
     return downloaded
+
+
+def _is_allowed_host(parsed: ParseResult, allowed: Set[str]) -> bool:
+    netloc = parsed.netloc.lower()
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    return netloc in allowed or hostname in allowed
+
+
+def _iter_attribute_strings(value: object) -> Iterator[str]:
+    if value is None:
+        return
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_attribute_strings(item)
+        return
+
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_attribute_strings(item)
+        return
+
+    yield str(value)
+
+
+def _normalize_pdf_candidate(candidate: str, base_url: str) -> Optional[str]:
+    candidate = candidate.strip().strip("'\"")
+    if not candidate or candidate.lower().startswith("javascript:"):
+        return None
+
+    if candidate.startswith("//"):
+        base_parsed = urlparse(base_url)
+        candidate = f"{base_parsed.scheme}:{candidate}"
+
+    normalized = urljoin(base_url, candidate)
+    parsed = urlparse(normalized)
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    if not parsed.path.lower().endswith(".pdf"):
+        return None
+
+    parsed = parsed._replace(fragment="")
+    return parsed.geturl()
+
+
+def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
+    discovered: Dict[str, None] = {}
+
+    for element in soup.find_all(True):
+        for attr_value in element.attrs.values():
+            for text_value in _iter_attribute_strings(attr_value):
+                for match in PDF_PATTERN.finditer(text_value):
+                    normalized = _normalize_pdf_candidate(match.group(0), base_url)
+                    if normalized:
+                        discovered.setdefault(normalized, None)
+
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text() or ""
+        for match in PDF_PATTERN.finditer(script_text):
+            normalized = _normalize_pdf_candidate(match.group(0), base_url)
+            if normalized:
+                discovered.setdefault(normalized, None)
+
+    return list(discovered.keys())
+
+
+def _get_with_ssl_fallback(
+    url: str,
+    *,
+    timeout: int,
+    stream: bool = False,
+) -> Optional[requests.Response]:
+    """Perform a GET request with an optional SSL verification fallback."""
+
+    try:
+        return _SESSION.get(url, timeout=timeout, stream=stream)
+    except requests.exceptions.Timeout:
+        logger.warning("Timeout while requesting %s", url)
+        return None
+    except requests.exceptions.SSLError as exc:  # pragma: no cover - network dependent
+        if not VERIFY_SSL:
+            logger.error("SSL error for %s despite verification disabled: %s", url, exc)
+            return None
+
+        logger.warning(
+            "SSL verification failed for %s (%s). Retrying without certificate checks.",
+            url,
+            exc,
+        )
+
+        try:
+            return _SESSION.get(url, timeout=timeout, stream=stream, verify=False)
+        except requests.exceptions.RequestException as insecure_exc:
+            logger.error(
+                "Fallback request without SSL verification failed for %s: %s",
+                url,
+                insecure_exc,
+            )
+            return None
+    except requests.exceptions.RequestException as exc:
+        logger.error("Request error for %s: %s", url, exc)
+        return None
 
 
 def _request_with_retries(
@@ -163,29 +279,29 @@ def _request_with_retries(
 
     attempt = 0
     while attempt < retries:
-        try:
-            response = _SESSION.get(url, timeout=15)
-            if response.status_code == 200:
-                logger.info("Successfully accessed %s", url)
-                return response
-
-            if response.status_code in (403, 404):
-                logger.warning("%s returned status %s", url, response.status_code)
-                return None
-
-            logger.warning(
-                "Failed to access %s, status code %s", url, response.status_code
-            )
-            return None
-        except requests.exceptions.Timeout:
+        response = _get_with_ssl_fallback(url, timeout=15)
+        if response is None:
             attempt += 1
+            if attempt >= retries:
+                break
             logger.warning(
-                "Timeout while requesting %s (attempt %s/%s)", url, attempt, retries
+                "Retrying %s after failure (attempt %s/%s)", url, attempt + 1, retries
             )
             time.sleep(delay)
-        except requests.exceptions.RequestException as exc:
-            logger.error("Request error for %s: %s", url, exc)
+            continue
+
+        if response.status_code == 200:
+            logger.info("Successfully accessed %s", url)
+            return response
+
+        if response.status_code in (403, 404):
+            logger.warning("%s returned status %s", url, response.status_code)
             return None
+
+        logger.warning(
+            "Failed to access %s, status code %s", url, response.status_code
+        )
+        return None
 
     logger.error("Giving up on %s after %s attempts", url, retries)
     return None
@@ -222,6 +338,38 @@ def _unique_target_path(folder: Path, pdf_name: str, url: str) -> Path:
     return candidate
 
 
+def _filename_from_content_disposition(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+
+    match = re.search(r"filename\*=([^;]+)", header_value, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1).strip().strip("\"')")
+        if value.lower().startswith("utf-8''"):
+            value = value[7:]
+        value = unquote(value)
+        return os.path.basename(value) or None
+
+    match = re.search(r"filename=([^;]+)", header_value, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1).strip().strip("\"')")
+        value = unquote(value)
+        return os.path.basename(value) or None
+
+    return None
+
+
+def _looks_like_pdf(first_chunk: bytes, headers: requests.structures.CaseInsensitiveDict) -> bool:
+    content_type = headers.get("Content-Type", "").lower()
+    if "pdf" in content_type:
+        return True
+
+    if first_chunk.lstrip().startswith(b"%PDF"):
+        return True
+
+    return False
+
+
 def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     """Download a PDF file and return metadata about it."""
 
@@ -229,32 +377,64 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     folder.mkdir(parents=True, exist_ok=True)
 
     parsed = urlparse(url)
-    pdf_name = os.path.basename(parsed.path) or "downloaded.pdf"
-    target_path = _unique_target_path(folder, pdf_name, url)
-    print("pdf:-------------------",pdf_name)
-    if target_path.exists():
-        logger.info("%s already exists, skipping download", target_path)
-        return {
-            "url": url,
-            "path": str(target_path),
-            "filename": target_path.name,
-            "downloaded_at": datetime.utcfromtimestamp(target_path.stat().st_mtime)
-            .isoformat()
-            + "Z",
-        }
+    fallback_name = os.path.basename(parsed.path) or "downloaded.pdf"
 
-    try:
-        response = _SESSION.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.Timeout:
-        logger.warning("Timeout while downloading %s", url)
-        return None
-    except requests.exceptions.RequestException as exc:
-        logger.error("Failed to download %s: %s", url, exc)
+    response = _get_with_ssl_fallback(url, timeout=30, stream=True)
+    if response is None:
+        logger.error("Failed to download %s due to request issues", url)
         return None
 
-    with open(target_path, "wb") as file_pointer:
-        file_pointer.write(response.content)
+    with closing(response):
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            logger.error("Failed to download %s: %s", url, exc)
+            return None
+
+        chunk_iterator = response.iter_content(chunk_size=8192)
+        first_chunk = b""
+        for chunk in chunk_iterator:
+            if chunk:
+                first_chunk = chunk
+                break
+
+        if not first_chunk:
+            logger.error("No content returned for %s", url)
+            return None
+
+        if not _looks_like_pdf(first_chunk, response.headers):
+            logger.warning(
+                "Content from %s does not appear to be a PDF (Content-Type: %s)",
+                url,
+                response.headers.get("Content-Type", "unknown"),
+            )
+            return None
+
+        header_filename = _filename_from_content_disposition(
+            response.headers.get("Content-Disposition")
+        )
+        pdf_name = header_filename or fallback_name
+        if not pdf_name.lower().endswith(".pdf"):
+            pdf_name = f"{pdf_name}.pdf"
+
+        target_path = _unique_target_path(folder, pdf_name, url)
+        if target_path.exists():
+            logger.info("%s already exists, skipping download", target_path)
+            return {
+                "url": url,
+                "path": str(target_path),
+                "filename": target_path.name,
+                "downloaded_at": datetime.utcfromtimestamp(
+                    target_path.stat().st_mtime
+                ).isoformat()
+                + "Z",
+            }
+
+        with open(target_path, "wb") as file_pointer:
+            file_pointer.write(first_chunk)
+            for chunk in chunk_iterator:
+                if chunk:
+                    file_pointer.write(chunk)
 
     logger.info("Downloaded %s", pdf_name)
     return {

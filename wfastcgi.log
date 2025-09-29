@@ -1,0 +1,52 @@
+2025-09-29 12:34:48.204022: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 12:34:48.205021: wfastcgi.py 3.0.0 initialized
+2025-09-29 12:34:48.762843: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 12:34:48.763842: wfastcgi.py 3.0.0 initialized
+2025-09-29 12:40:02.623798: Unhandled exception in wfastcgi.py: Traceback (most recent call last):
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 776, in main
+    record = read_fastcgi_record(fcgi_stream)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 160, in read_fastcgi_record
+    data = stream.read(8)     # read record
+           ^^^^^^^^^^^^^^
+OSError: [Errno 22] Invalid argument
+2025-09-29 12:40:02.623798: Running on_exit tasks
+2025-09-29 12:40:02.639388: wfastcgi.py 3.0.0 closed
+2025-09-29 12:40:03.295743: Unhandled exception in wfastcgi.py: Traceback (most recent call last):
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 776, in main
+    record = read_fastcgi_record(fcgi_stream)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 160, in read_fastcgi_record
+    data = stream.read(8)     # read record
+           ^^^^^^^^^^^^^^
+OSError: [Errno 22] Invalid argument
+2025-09-29 12:40:03.295743: Running on_exit tasks
+2025-09-29 12:40:03.295743: wfastcgi.py 3.0.0 closed
+2025-09-29 13:06:34.426806: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 13:06:34.427809: wfastcgi.py 3.0.0 initialized
+2025-09-29 13:06:34.939144: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 13:06:34.939144: wfastcgi.py 3.0.0 initialized
+2025-09-29 13:21:43.959547: Unhandled exception in wfastcgi.py: Traceback (most recent call last):
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 776, in main
+    record = read_fastcgi_record(fcgi_stream)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 160, in read_fastcgi_record
+    data = stream.read(8)     # read record
+           ^^^^^^^^^^^^^^
+OSError: [Errno 22] Invalid argument
+2025-09-29 13:21:43.959547: Running on_exit tasks
+2025-09-29 13:21:43.959547: wfastcgi.py 3.0.0 closed
+2025-09-29 13:21:44.459446: Unhandled exception in wfastcgi.py: Traceback (most recent call last):
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 776, in main
+    record = read_fastcgi_record(fcgi_stream)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\inetpub\wwwroot\pdf_scraper_project\env\Lib\site-packages\wfastcgi.py", line 160, in read_fastcgi_record
+    data = stream.read(8)     # read record
+           ^^^^^^^^^^^^^^
+OSError: [Errno 22] Invalid argument
+2025-09-29 13:21:44.459446: Running on_exit tasks
+2025-09-29 13:21:44.459446: wfastcgi.py 3.0.0 closed
+2025-09-29 14:04:49.774161: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 14:04:49.776164: wfastcgi.py 3.0.0 initialized
+2025-09-29 14:04:50.320700: wfastcgi.py will restart when files in C:\inetpub\wwwroot\pdf_scraper_project\ are changed: .*((\.py)|(\.config))$
+2025-09-29 14:04:50.321607: wfastcgi.py 3.0.0 initialized

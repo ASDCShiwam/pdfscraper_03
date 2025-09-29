@@ -154,6 +154,44 @@ def crawl_and_download(
     return downloaded
 
 
+def _get_with_ssl_fallback(
+    url: str,
+    *,
+    timeout: int,
+    stream: bool = False,
+) -> Optional[requests.Response]:
+    """Perform a GET request with an optional SSL verification fallback."""
+
+    try:
+        return _SESSION.get(url, timeout=timeout, stream=stream)
+    except requests.exceptions.Timeout:
+        logger.warning("Timeout while requesting %s", url)
+        return None
+    except requests.exceptions.SSLError as exc:  # pragma: no cover - network dependent
+        if not VERIFY_SSL:
+            logger.error("SSL error for %s despite verification disabled: %s", url, exc)
+            return None
+
+        logger.warning(
+            "SSL verification failed for %s (%s). Retrying without certificate checks.",
+            url,
+            exc,
+        )
+
+        try:
+            return _SESSION.get(url, timeout=timeout, stream=stream, verify=False)
+        except requests.exceptions.RequestException as insecure_exc:
+            logger.error(
+                "Fallback request without SSL verification failed for %s: %s",
+                url,
+                insecure_exc,
+            )
+            return None
+    except requests.exceptions.RequestException as exc:
+        logger.error("Request error for %s: %s", url, exc)
+        return None
+
+
 def _request_with_retries(
     url: str,
     retries: int = 3,
@@ -163,29 +201,29 @@ def _request_with_retries(
 
     attempt = 0
     while attempt < retries:
-        try:
-            response = _SESSION.get(url, timeout=15)
-            if response.status_code == 200:
-                logger.info("Successfully accessed %s", url)
-                return response
-
-            if response.status_code in (403, 404):
-                logger.warning("%s returned status %s", url, response.status_code)
-                return None
-
-            logger.warning(
-                "Failed to access %s, status code %s", url, response.status_code
-            )
-            return None
-        except requests.exceptions.Timeout:
+        response = _get_with_ssl_fallback(url, timeout=15)
+        if response is None:
             attempt += 1
+            if attempt >= retries:
+                break
             logger.warning(
-                "Timeout while requesting %s (attempt %s/%s)", url, attempt, retries
+                "Retrying %s after failure (attempt %s/%s)", url, attempt + 1, retries
             )
             time.sleep(delay)
-        except requests.exceptions.RequestException as exc:
-            logger.error("Request error for %s: %s", url, exc)
+            continue
+
+        if response.status_code == 200:
+            logger.info("Successfully accessed %s", url)
+            return response
+
+        if response.status_code in (403, 404):
+            logger.warning("%s returned status %s", url, response.status_code)
             return None
+
+        logger.warning(
+            "Failed to access %s, status code %s", url, response.status_code
+        )
+        return None
 
     logger.error("Giving up on %s after %s attempts", url, retries)
     return None
@@ -243,12 +281,13 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
             + "Z",
         }
 
-    try:
-        response = _SESSION.get(url, timeout=30)
-        response.raise_for_status()
-    except requests.exceptions.Timeout:
-        logger.warning("Timeout while downloading %s", url)
+    response = _get_with_ssl_fallback(url, timeout=30, stream=False)
+    if response is None:
+        logger.error("Failed to download %s due to request issues", url)
         return None
+
+    try:
+        response.raise_for_status()
     except requests.exceptions.RequestException as exc:
         logger.error("Failed to download %s: %s", url, exc)
         return None

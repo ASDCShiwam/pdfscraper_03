@@ -34,3 +34,18 @@ def test_path_placeholder_is_replaced():
     results = _collect("files/sample.pdf", {"download.php?doc={path}"})
 
     assert "https://example.com/base/download.php?doc=files/sample.pdf" in results
+
+
+def test_space_in_filename_is_not_double_encoded():
+    results = _collect(
+        "files/My File.pdf",
+        {"download.php?download=", "download.php?show=existing"},
+    )
+
+    assert (
+        "https://example.com/base/download.php?download=files%2FMy%20File.pdf"
+        in results
+    )
+    assert (
+        "https://example.com/base/download.php?show=files%2FMy%20File.pdf" in results
+    )

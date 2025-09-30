@@ -342,13 +342,29 @@ def _expand_watermark_downloads(
 
             parsed = urlparse(resolved)
             query = parsed.query
+            parameters = parse_qsl(query, keep_blank_values=True) if query else []
+
+            if parameters:
+                updated_parameters = []
+                replaced_blank = False
+                for key, value in parameters:
+                    if not replaced_blank and value == "":
+                        updated_parameters.append((key, encoded_variant))
+                        replaced_blank = True
+                    else:
+                        updated_parameters.append((key, value))
+
+                if replaced_blank:
+                    new_query = urlencode(updated_parameters, doseq=True)
+                    yield urlunparse(parsed._replace(query=new_query))
+                    continue
 
             if query.endswith("show="):
                 yield resolved + encoded_variant
                 continue
 
             if "show=" in query:
-                parameters = parse_qsl(query, keep_blank_values=True)
+                parameters = parameters or parse_qsl(query, keep_blank_values=True)
                 updated = False
                 for index, (key, _value) in enumerate(parameters):
                     if key == "show":
@@ -516,7 +532,6 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     response = _get_with_ssl_fallback(url, timeout=30, stream=True)
     if response is None:
         logger.error("Failed to download %s due to request issues", url)
-=======
     response = _get_with_ssl_fallback(url, timeout=30, stream=False)
     if response is None:
         logger.error("Failed to download %s due to request issues", url)

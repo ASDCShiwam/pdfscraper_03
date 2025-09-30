@@ -4,9 +4,23 @@ import os
 import re
 import time
 from collections import deque
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set
+
+from urllib.parse import (
+    ParseResult,
+    parse_qsl,
+    quote,
+    urlencode,
+    urljoin,
+    urldefrag,
+    urlparse,
+    urlunparse,
+    unquote,
+)
+
 from urllib.parse import ParseResult, urljoin, urldefrag, urlparse
 
 import bs4
@@ -32,7 +46,20 @@ _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 _SESSION.verify = VERIFY_SSL
 
+
+PDF_PATTERN = re.compile(
+    r"[^'\"()<>\\]+\.pdf(?:[?#][^'\"()<>\\]*)?", re.IGNORECASE
+)
+DOWNLOAD_CALL_PATTERN = re.compile(
+    r"downloadWithWatermark\s*\((?P<arg>[^)]*)\)", re.IGNORECASE
+)
+DOWNLOAD_TEMPLATE_PATTERN = re.compile(
+    r"['\"](?P<template>[^'\"<>]*download\.php[^'\"<>]*)['\"]",
+    re.IGNORECASE,
+)
+
 PDF_PATTERN = re.compile(r"[^'\"()<>\\\s]+\.pdf(?:[?#][^'\"()<>\\\s]*)?", re.IGNORECASE)
+
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +192,6 @@ def crawl_and_download(
     return downloaded
 
 
-
 def _is_allowed_host(parsed: ParseResult, allowed: Set[str]) -> bool:
     netloc = parsed.netloc.lower()
     hostname = parsed.hostname.lower() if parsed.hostname else ""
@@ -214,9 +240,19 @@ def _normalize_pdf_candidate(candidate: str, base_url: str) -> Optional[str]:
 def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
     discovered: Dict[str, None] = {}
 
+    watermark_arguments: Set[str] = set()
+    download_templates: Set[str] = set()
+
+
     for element in soup.find_all(True):
         for attr_value in element.attrs.values():
             for text_value in _iter_attribute_strings(attr_value):
+
+                for call in DOWNLOAD_CALL_PATTERN.finditer(text_value):
+                    cleaned = _clean_js_argument(call.group("arg"))
+                    if cleaned:
+                        watermark_arguments.add(cleaned)
+
                 for match in PDF_PATTERN.finditer(text_value):
                     normalized = _normalize_pdf_candidate(match.group(0), base_url)
                     if normalized:
@@ -224,12 +260,108 @@ def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
 
     for script in soup.find_all("script"):
         script_text = script.string or script.get_text() or ""
+
+        for call in DOWNLOAD_CALL_PATTERN.finditer(script_text):
+            cleaned = _clean_js_argument(call.group("arg"))
+            if cleaned:
+                watermark_arguments.add(cleaned)
+
         for match in PDF_PATTERN.finditer(script_text):
             normalized = _normalize_pdf_candidate(match.group(0), base_url)
             if normalized:
                 discovered.setdefault(normalized, None)
 
+        for template_match in DOWNLOAD_TEMPLATE_PATTERN.finditer(script_text):
+            template = template_match.group("template").strip()
+            if template:
+                download_templates.add(template)
+
+    if watermark_arguments:
+        resolved_templates = {
+            urljoin(base_url, template)
+            for template in download_templates
+            if template
+        }
+        for argument in watermark_arguments:
+            for candidate in _expand_watermark_downloads(
+                argument, resolved_templates, base_url
+            ):
+                discovered.setdefault(candidate, None)
+
+
     return list(discovered.keys())
+
+
+
+def _clean_js_argument(argument: str) -> Optional[str]:
+    value = argument.strip()
+    if not value:
+        return None
+
+    if value[0] in {'"', "'"} and value[-1] == value[0]:
+        value = value[1:-1]
+
+    return value.strip() or None
+
+
+def _argument_variants(argument: str) -> List[str]:
+    normalized = argument.strip().replace("\\", "/")
+    variants: Dict[str, None] = {}
+
+    def _add(candidate: str) -> None:
+        candidate = candidate.strip()
+        if candidate:
+            variants.setdefault(candidate, None)
+
+    _add(normalized)
+    _add(normalized.lstrip("/"))
+    if normalized.lower().startswith("pdf/"):
+        _add(normalized[4:])
+    if normalized.startswith("./"):
+        _add(normalized[2:])
+
+    return list(variants.keys())
+
+
+def _expand_watermark_downloads(
+    argument: str, templates: Set[str], base_url: str
+) -> Iterator[str]:
+    for variant in _argument_variants(argument):
+        yield urljoin(base_url, variant)
+
+        encoded_variant = quote(variant, safe="/:")
+
+        for template in templates:
+            resolved = urljoin(base_url, template)
+            if not resolved.lower().startswith(("http://", "https://")):
+                continue
+
+            if "{path}" in resolved:
+                yield resolved.replace("{path}", encoded_variant)
+                continue
+
+            parsed = urlparse(resolved)
+            query = parsed.query
+
+            if query.endswith("show="):
+                yield resolved + encoded_variant
+                continue
+
+            if "show=" in query:
+                parameters = parse_qsl(query, keep_blank_values=True)
+                updated = False
+                for index, (key, _value) in enumerate(parameters):
+                    if key == "show":
+                        parameters[index] = (key, encoded_variant)
+                        updated = True
+                if not updated:
+                    parameters.append(("show", encoded_variant))
+                new_query = urlencode(parameters, doseq=True)
+                yield urlunparse(parsed._replace(query=new_query))
+                continue
+
+            separator = "&" if query else "?"
+            yield resolved + f"{separator}show={encoded_variant}"
 
 
 
@@ -339,6 +471,38 @@ def _unique_target_path(folder: Path, pdf_name: str, url: str) -> Path:
     return candidate
 
 
+def _filename_from_content_disposition(header_value: Optional[str]) -> Optional[str]:
+    if not header_value:
+        return None
+
+    match = re.search(r"filename\*=([^;]+)", header_value, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1).strip().strip("\"')")
+        if value.lower().startswith("utf-8''"):
+            value = value[7:]
+        value = unquote(value)
+        return os.path.basename(value) or None
+
+    match = re.search(r"filename=([^;]+)", header_value, flags=re.IGNORECASE)
+    if match:
+        value = match.group(1).strip().strip("\"')")
+        value = unquote(value)
+        return os.path.basename(value) or None
+
+    return None
+
+
+def _looks_like_pdf(first_chunk: bytes, headers: requests.structures.CaseInsensitiveDict) -> bool:
+    content_type = headers.get("Content-Type", "").lower()
+    if "pdf" in content_type:
+        return True
+
+    if first_chunk.lstrip().startswith(b"%PDF"):
+        return True
+
+    return False
+
+
 def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     """Download a PDF file and return metadata about it."""
 
@@ -346,20 +510,13 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     folder.mkdir(parents=True, exist_ok=True)
 
     parsed = urlparse(url)
-    pdf_name = os.path.basename(parsed.path) or "downloaded.pdf"
-    target_path = _unique_target_path(folder, pdf_name, url)
-    print("pdf:-------------------",pdf_name)
-    if target_path.exists():
-        logger.info("%s already exists, skipping download", target_path)
-        return {
-            "url": url,
-            "path": str(target_path),
-            "filename": target_path.name,
-            "downloaded_at": datetime.utcfromtimestamp(target_path.stat().st_mtime)
-            .isoformat()
-            + "Z",
-        }
+    fallback_name = os.path.basename(parsed.path) or "downloaded.pdf"
 
+
+    response = _get_with_ssl_fallback(url, timeout=30, stream=True)
+    if response is None:
+        logger.error("Failed to download %s due to request issues", url)
+=======
     response = _get_with_ssl_fallback(url, timeout=30, stream=False)
     if response is None:
         logger.error("Failed to download %s due to request issues", url)
@@ -369,10 +526,60 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
         response.raise_for_status()
     except requests.exceptions.RequestException as exc:
         logger.error("Failed to download %s: %s", url, exc)
+
         return None
 
-    with open(target_path, "wb") as file_pointer:
-        file_pointer.write(response.content)
+    with closing(response):
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            logger.error("Failed to download %s: %s", url, exc)
+            return None
+
+        chunk_iterator = response.iter_content(chunk_size=8192)
+        first_chunk = b""
+        for chunk in chunk_iterator:
+            if chunk:
+                first_chunk = chunk
+                break
+
+        if not first_chunk:
+            logger.error("No content returned for %s", url)
+            return None
+
+        if not _looks_like_pdf(first_chunk, response.headers):
+            logger.warning(
+                "Content from %s does not appear to be a PDF (Content-Type: %s)",
+                url,
+                response.headers.get("Content-Type", "unknown"),
+            )
+            return None
+
+        header_filename = _filename_from_content_disposition(
+            response.headers.get("Content-Disposition")
+        )
+        pdf_name = header_filename or fallback_name
+        if not pdf_name.lower().endswith(".pdf"):
+            pdf_name = f"{pdf_name}.pdf"
+
+        target_path = _unique_target_path(folder, pdf_name, url)
+        if target_path.exists():
+            logger.info("%s already exists, skipping download", target_path)
+            return {
+                "url": url,
+                "path": str(target_path),
+                "filename": target_path.name,
+                "downloaded_at": datetime.utcfromtimestamp(
+                    target_path.stat().st_mtime
+                ).isoformat()
+                + "Z",
+            }
+
+        with open(target_path, "wb") as file_pointer:
+            file_pointer.write(first_chunk)
+            for chunk in chunk_iterator:
+                if chunk:
+                    file_pointer.write(chunk)
 
     logger.info("Downloaded %s", pdf_name)
     return {

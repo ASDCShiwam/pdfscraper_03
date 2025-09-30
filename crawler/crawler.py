@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set
+
 from urllib.parse import (
     ParseResult,
     parse_qsl,
@@ -19,6 +20,8 @@ from urllib.parse import (
     urlunparse,
     unquote,
 )
+
+from urllib.parse import ParseResult, urljoin, urldefrag, urlparse
 
 import bs4
 import requests
@@ -43,6 +46,7 @@ _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 _SESSION.verify = VERIFY_SSL
 
+
 PDF_PATTERN = re.compile(
     r"[^'\"()<>\\]+\.pdf(?:[?#][^'\"()<>\\]*)?", re.IGNORECASE
 )
@@ -53,6 +57,9 @@ DOWNLOAD_TEMPLATE_PATTERN = re.compile(
     r"['\"](?P<template>[^'\"<>]*download\.php[^'\"<>]*)['\"]",
     re.IGNORECASE,
 )
+
+PDF_PATTERN = re.compile(r"[^'\"()<>\\\s]+\.pdf(?:[?#][^'\"()<>\\\s]*)?", re.IGNORECASE)
+
 
 logger = logging.getLogger(__name__)
 
@@ -232,16 +239,20 @@ def _normalize_pdf_candidate(candidate: str, base_url: str) -> Optional[str]:
 
 def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
     discovered: Dict[str, None] = {}
+
     watermark_arguments: Set[str] = set()
     download_templates: Set[str] = set()
+
 
     for element in soup.find_all(True):
         for attr_value in element.attrs.values():
             for text_value in _iter_attribute_strings(attr_value):
+
                 for call in DOWNLOAD_CALL_PATTERN.finditer(text_value):
                     cleaned = _clean_js_argument(call.group("arg"))
                     if cleaned:
                         watermark_arguments.add(cleaned)
+
                 for match in PDF_PATTERN.finditer(text_value):
                     normalized = _normalize_pdf_candidate(match.group(0), base_url)
                     if normalized:
@@ -249,14 +260,17 @@ def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
 
     for script in soup.find_all("script"):
         script_text = script.string or script.get_text() or ""
+
         for call in DOWNLOAD_CALL_PATTERN.finditer(script_text):
             cleaned = _clean_js_argument(call.group("arg"))
             if cleaned:
                 watermark_arguments.add(cleaned)
+
         for match in PDF_PATTERN.finditer(script_text):
             normalized = _normalize_pdf_candidate(match.group(0), base_url)
             if normalized:
                 discovered.setdefault(normalized, None)
+
         for template_match in DOWNLOAD_TEMPLATE_PATTERN.finditer(script_text):
             template = template_match.group("template").strip()
             if template:
@@ -274,7 +288,9 @@ def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
             ):
                 discovered.setdefault(candidate, None)
 
+
     return list(discovered.keys())
+
 
 
 def _clean_js_argument(argument: str) -> Optional[str]:
@@ -346,6 +362,7 @@ def _expand_watermark_downloads(
 
             separator = "&" if query else "?"
             yield resolved + f"{separator}show={encoded_variant}"
+
 
 
 def _get_with_ssl_fallback(
@@ -495,9 +512,21 @@ def download_pdf(url: str, folder: Path) -> Optional[Dict[str, str]]:
     parsed = urlparse(url)
     fallback_name = os.path.basename(parsed.path) or "downloaded.pdf"
 
+
     response = _get_with_ssl_fallback(url, timeout=30, stream=True)
     if response is None:
         logger.error("Failed to download %s due to request issues", url)
+=======
+    response = _get_with_ssl_fallback(url, timeout=30, stream=False)
+    if response is None:
+        logger.error("Failed to download %s due to request issues", url)
+        return None
+
+    try:
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.error("Failed to download %s: %s", url, exc)
+
         return None
 
     with closing(response):

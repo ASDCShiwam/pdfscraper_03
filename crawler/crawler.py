@@ -7,7 +7,7 @@ from collections import deque
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Set
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 from urllib.parse import (
     ParseResult,
@@ -323,6 +323,13 @@ def _argument_variants(argument: str) -> List[str]:
     return list(variants.keys())
 
 
+_QUERY_SAFE_CHARS = ":%"
+
+
+def _encode_query_parameters(parameters: List[Tuple[str, str]]) -> str:
+    return urlencode(parameters, doseq=True, safe=_QUERY_SAFE_CHARS, quote_via=quote)
+
+
 def _expand_watermark_downloads(
     argument: str, templates: Set[str], base_url: str
 ) -> Iterator[str]:
@@ -349,13 +356,13 @@ def _expand_watermark_downloads(
                 replaced_blank = False
                 for key, value in parameters:
                     if not replaced_blank and value == "":
-                        updated_parameters.append((key, encoded_variant))
+                        updated_parameters.append((key, variant))
                         replaced_blank = True
                     else:
                         updated_parameters.append((key, value))
 
                 if replaced_blank:
-                    new_query = urlencode(updated_parameters, doseq=True)
+                    new_query = _encode_query_parameters(updated_parameters)
                     yield urlunparse(parsed._replace(query=new_query))
                     continue
 
@@ -368,11 +375,11 @@ def _expand_watermark_downloads(
                 updated = False
                 for index, (key, _value) in enumerate(parameters):
                     if key == "show":
-                        parameters[index] = (key, encoded_variant)
+                        parameters[index] = (key, variant)
                         updated = True
                 if not updated:
-                    parameters.append(("show", encoded_variant))
-                new_query = urlencode(parameters, doseq=True)
+                    parameters.append(("show", variant))
+                new_query = _encode_query_parameters(parameters)
                 yield urlunparse(parsed._replace(query=new_query))
                 continue
 

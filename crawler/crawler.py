@@ -8,7 +8,17 @@ from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Set
-from urllib.parse import ParseResult, urljoin, urldefrag, urlparse, unquote
+from urllib.parse import (
+    ParseResult,
+    parse_qsl,
+    quote,
+    urlencode,
+    urljoin,
+    urldefrag,
+    urlparse,
+    urlunparse,
+    unquote,
+)
 
 import bs4
 import requests
@@ -33,7 +43,16 @@ _SESSION = requests.Session()
 _SESSION.headers.update(HEADERS)
 _SESSION.verify = VERIFY_SSL
 
-PDF_PATTERN = re.compile(r"[^'\"()<>\\\s]+\.pdf(?:[?#][^'\"()<>\\\s]*)?", re.IGNORECASE)
+PDF_PATTERN = re.compile(
+    r"[^'\"()<>\\]+\.pdf(?:[?#][^'\"()<>\\]*)?", re.IGNORECASE
+)
+DOWNLOAD_CALL_PATTERN = re.compile(
+    r"downloadWithWatermark\s*\((?P<arg>[^)]*)\)", re.IGNORECASE
+)
+DOWNLOAD_TEMPLATE_PATTERN = re.compile(
+    r"['\"](?P<template>[^'\"<>]*download\.php[^'\"<>]*)['\"]",
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,10 +232,16 @@ def _normalize_pdf_candidate(candidate: str, base_url: str) -> Optional[str]:
 
 def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
     discovered: Dict[str, None] = {}
+    watermark_arguments: Set[str] = set()
+    download_templates: Set[str] = set()
 
     for element in soup.find_all(True):
         for attr_value in element.attrs.values():
             for text_value in _iter_attribute_strings(attr_value):
+                for call in DOWNLOAD_CALL_PATTERN.finditer(text_value):
+                    cleaned = _clean_js_argument(call.group("arg"))
+                    if cleaned:
+                        watermark_arguments.add(cleaned)
                 for match in PDF_PATTERN.finditer(text_value):
                     normalized = _normalize_pdf_candidate(match.group(0), base_url)
                     if normalized:
@@ -224,12 +249,103 @@ def _extract_pdf_urls(soup: BeautifulSoup, base_url: str) -> List[str]:
 
     for script in soup.find_all("script"):
         script_text = script.string or script.get_text() or ""
+        for call in DOWNLOAD_CALL_PATTERN.finditer(script_text):
+            cleaned = _clean_js_argument(call.group("arg"))
+            if cleaned:
+                watermark_arguments.add(cleaned)
         for match in PDF_PATTERN.finditer(script_text):
             normalized = _normalize_pdf_candidate(match.group(0), base_url)
             if normalized:
                 discovered.setdefault(normalized, None)
+        for template_match in DOWNLOAD_TEMPLATE_PATTERN.finditer(script_text):
+            template = template_match.group("template").strip()
+            if template:
+                download_templates.add(template)
+
+    if watermark_arguments:
+        resolved_templates = {
+            urljoin(base_url, template)
+            for template in download_templates
+            if template
+        }
+        for argument in watermark_arguments:
+            for candidate in _expand_watermark_downloads(
+                argument, resolved_templates, base_url
+            ):
+                discovered.setdefault(candidate, None)
 
     return list(discovered.keys())
+
+
+def _clean_js_argument(argument: str) -> Optional[str]:
+    value = argument.strip()
+    if not value:
+        return None
+
+    if value[0] in {'"', "'"} and value[-1] == value[0]:
+        value = value[1:-1]
+
+    return value.strip() or None
+
+
+def _argument_variants(argument: str) -> List[str]:
+    normalized = argument.strip().replace("\\", "/")
+    variants: Dict[str, None] = {}
+
+    def _add(candidate: str) -> None:
+        candidate = candidate.strip()
+        if candidate:
+            variants.setdefault(candidate, None)
+
+    _add(normalized)
+    _add(normalized.lstrip("/"))
+    if normalized.lower().startswith("pdf/"):
+        _add(normalized[4:])
+    if normalized.startswith("./"):
+        _add(normalized[2:])
+
+    return list(variants.keys())
+
+
+def _expand_watermark_downloads(
+    argument: str, templates: Set[str], base_url: str
+) -> Iterator[str]:
+    for variant in _argument_variants(argument):
+        yield urljoin(base_url, variant)
+
+        encoded_variant = quote(variant, safe="/:")
+
+        for template in templates:
+            resolved = urljoin(base_url, template)
+            if not resolved.lower().startswith(("http://", "https://")):
+                continue
+
+            if "{path}" in resolved:
+                yield resolved.replace("{path}", encoded_variant)
+                continue
+
+            parsed = urlparse(resolved)
+            query = parsed.query
+
+            if query.endswith("show="):
+                yield resolved + encoded_variant
+                continue
+
+            if "show=" in query:
+                parameters = parse_qsl(query, keep_blank_values=True)
+                updated = False
+                for index, (key, _value) in enumerate(parameters):
+                    if key == "show":
+                        parameters[index] = (key, encoded_variant)
+                        updated = True
+                if not updated:
+                    parameters.append(("show", encoded_variant))
+                new_query = urlencode(parameters, doseq=True)
+                yield urlunparse(parsed._replace(query=new_query))
+                continue
+
+            separator = "&" if query else "?"
+            yield resolved + f"{separator}show={encoded_variant}"
 
 
 def _get_with_ssl_fallback(
